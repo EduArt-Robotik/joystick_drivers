@@ -27,8 +27,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef JOY__JOY_HPP_
-#define JOY__JOY_HPP_
+#pragma once
 
 #include <SDL.h>
 
@@ -66,21 +65,21 @@ private:
   float convertRawAxisValueToROS(int16_t val);
   void feedbackCb(const std::shared_ptr<sensor_msgs::msg::JoyFeedback> msg);
 
-  int dev_id_{0};
+  struct Parameter {
+    int dev_id{0};
+    std::string dev_name;
+    int32_t joystick_instance_id{0};
+    double scaled_deadzone{0.0};
+    double unscaled_deadzone{0.0};
+    double scale{0.0};
+    bool sticky_buttons{false};
+    rclcpp::Duration publishing_interval = rclcpp::Duration(0, 10000000); // default: 10ms
+    std::string frame_id_ = "joy";
+  } parameter_;
 
   SDL_Joystick * joystick_{nullptr};
   SDL_Haptic * haptic_{nullptr};
-  int32_t joystick_instance_id_{0};
-  double scaled_deadzone_{0.0};
-  double unscaled_deadzone_{0.0};
-  double scale_{0.0};
-  double autorepeat_rate_{0.0};
-  int autorepeat_interval_ms_{0};
-  bool sticky_buttons_{false};
-  bool publish_soon_{false};
-  rclcpp::Time publish_soon_time_;
-  int coalesce_interval_ms_{0};
-  std::string dev_name_;
+
   std::thread event_thread_;
   std::shared_future<void> future_;
   std::promise<void> exit_signal_;
@@ -91,5 +90,3 @@ private:
 };
 
 }  // namespace joy
-
-#endif  // JOY__JOY_HPP_

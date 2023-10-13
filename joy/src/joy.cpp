@@ -51,18 +51,18 @@ namespace joy
 Joy::Joy(const rclcpp::NodeOptions & options)
 : rclcpp::Node("joy_node", options)
 {
-  dev_id_ = static_cast<int>(this->declare_parameter("device_id", 0));
+  parameter_.dev_id = static_cast<int>(this->declare_parameter("device_id", 0));
 
-  dev_name_ = this->declare_parameter("device_name", std::string(""));
+  parameter_.dev_name = this->declare_parameter("device_name", std::string(""));
 
   // The user specifies the deadzone to us in the range of 0.0 to 1.0.  Later on
   // we'll convert that to the range of 0 to 32767.  Note also that negatives
   // are not allowed, as this is a +/- value.
-  scaled_deadzone_ = this->declare_parameter("deadzone", 0.05);
-  if (scaled_deadzone_ < 0.0 || scaled_deadzone_ > 1.0) {
+  parameter_.scaled_deadzone = this->declare_parameter("deadzone", 0.05);
+  if (parameter_.scaled_deadzone < 0.0 || parameter_.scaled_deadzone > 1.0) {
     throw std::runtime_error("Deadzone must be between 0.0 and 1.0");
   }
-  unscaled_deadzone_ = 32767.0 * scaled_deadzone_;
+  parameter_.unscaled_deadzone = 32767.0 * parameter_.scaled_deadzone;
   // According to the SDL documentation, this always returns a value between
   // -32768 and 32767.  However, we want to report a value between -1.0 and 1.0,
   // hence the "scale" dividing by 32767.  Also note that SDL returns the axes
@@ -70,31 +70,18 @@ Joy::Joy(const rclcpp::NodeOptions & options)
   // conventionof "forward" and "left" as positive, so we invert the axes here
   // as well.  Finally, we take into account the amount of deadzone so we truly
   // do get value between -1.0 and 1.0 (and not -deadzone to +deadzone).
-  scale_ = static_cast<float>(-1.0 / (1.0 - scaled_deadzone_) / 32767.0);
+  parameter_.scale = static_cast<float>(-1.0 / (1.0 - parameter_.scaled_deadzone) / 32767.0);
 
-  autorepeat_rate_ = this->declare_parameter("autorepeat_rate", 20.0);
-  if (autorepeat_rate_ < 0.0) {
-    throw std::runtime_error("Autorepeat rate must be >= 0.0");
-  } else if (autorepeat_rate_ > 1000.0) {
-    throw std::runtime_error("Autorepeat rate must be <= 1000.0");
-  } else if (autorepeat_rate_ > 0.0) {
-    autorepeat_interval_ms_ = static_cast<int>(1000.0 / autorepeat_rate_);
+  const double publishing_rate = this->declare_parameter("rate", 20.0);
+  if (publishing_rate < 0.0) {
+    throw std::runtime_error("rate must be >= 0.0");
+  } else if (publishing_rate > 1000.0) {
+    throw std::runtime_error("rate must be <= 1000.0");
   } else {
-    // If the autorepeat rate is set to 0, the user doesn't want us to
-    // publish unless an event happens.  We still wake up every 200
-    // milliseconds to check if we need to quit.
-    autorepeat_interval_ms_ = 200;
+    parameter_.publishing_interval = rclcpp::Duration(0, (1.0 / publishing_rate) * 1000 * 1000 * 1000);
   }
 
-  sticky_buttons_ = this->declare_parameter("sticky_buttons", false);
-
-  coalesce_interval_ms_ = static_cast<int>(this->declare_parameter("coalesce_interval_ms", 1));
-  if (coalesce_interval_ms_ < 0) {
-    throw std::runtime_error("coalesce_interval_ms must be positive");
-  }
-  // Make sure to initialize publish_soon_time regardless of whether we are going
-  // to use it; this ensures that we are always using the correct time source.
-  publish_soon_time_ = this->now();
+  parameter_.sticky_buttons = this->declare_parameter("sticky_buttons", false);
 
   pub_ = create_publisher<sensor_msgs::msg::Joy>("joy", 10);
 
@@ -168,100 +155,78 @@ float Joy::convertRawAxisValueToROS(int16_t val)
   double double_val = static_cast<double>(val);
   // Apply the deadzone semantic here.  This allows the deadzone
   // to be "smooth".
-  if (double_val > unscaled_deadzone_) {
-    double_val -= unscaled_deadzone_;
-  } else if (double_val < -unscaled_deadzone_) {
-    double_val += unscaled_deadzone_;
+  if (double_val > parameter_.unscaled_deadzone) {
+    double_val -= parameter_.unscaled_deadzone;
+  } else if (double_val < -parameter_.unscaled_deadzone) {
+    double_val += parameter_.unscaled_deadzone;
   } else {
     double_val = 0.0;
   }
 
-  return static_cast<float>(double_val * scale_);
+  return static_cast<float>(double_val * parameter_.scale);
 }
 
 bool Joy::handleJoyAxis(const SDL_Event & e)
 {
-  bool publish = false;
-
-  if (e.jaxis.which != joystick_instance_id_) {
-    return publish;
+  if (e.jaxis.which != parameter_.joystick_instance_id) {
+    return false;
   }
 
   if (e.jaxis.axis >= joy_msg_.axes.size()) {
     RCLCPP_WARN(get_logger(), "Saw axes too large for this device, ignoring");
-    return publish;
+    return false;
   }
 
   float last_axis_value = joy_msg_.axes.at(e.jaxis.axis);
   joy_msg_.axes.at(e.jaxis.axis) = convertRawAxisValueToROS(e.jaxis.value);
-  if (last_axis_value != joy_msg_.axes.at(e.jaxis.axis)) {
-    if (coalesce_interval_ms_ > 0 && !publish_soon_) {
-      publish_soon_ = true;
-      publish_soon_time_ = this->now();
-    } else {
-      rclcpp::Duration time_since_publish_soon = this->now() - publish_soon_time_;
-      if (time_since_publish_soon.nanoseconds() >= RCL_MS_TO_NS(coalesce_interval_ms_)) {
-        publish = true;
-        publish_soon_ = false;
-      }
-    }
-  }
-  // else no change, so don't publish
 
-  return publish;
+  return last_axis_value != joy_msg_.axes.at(e.jaxis.axis);
 }
 
 bool Joy::handleJoyButtonDown(const SDL_Event & e)
 {
-  bool publish = false;
-
-  if (e.jbutton.which != joystick_instance_id_) {
-    return publish;
+  if (e.jbutton.which != parameter_.joystick_instance_id) {
+    return false;
   }
 
   if (e.jbutton.button >= joy_msg_.buttons.size()) {
     RCLCPP_WARN(get_logger(), "Saw button too large for this device, ignoring");
-    return publish;
+    return false;
   }
 
-  if (sticky_buttons_) {
+  if (parameter_.sticky_buttons) {
     // For sticky buttons, invert 0 -> 1 or 1 -> 0
     joy_msg_.buttons.at(e.jbutton.button) = 1 - joy_msg_.buttons.at(e.jbutton.button);
   } else {
     joy_msg_.buttons.at(e.jbutton.button) = 1;
   }
-  publish = true;
 
-  return publish;
+  return true;
 }
 
 bool Joy::handleJoyButtonUp(const SDL_Event & e)
 {
-  bool publish = false;
-
-  if (e.jbutton.which != joystick_instance_id_) {
-    return publish;
+  if (e.jbutton.which != parameter_.joystick_instance_id) {
+    return false;
   }
 
   if (e.jbutton.button >= joy_msg_.buttons.size()) {
     RCLCPP_WARN(get_logger(), "Saw button too large for this device, ignoring");
-    return publish;
+    return false;
   }
 
-  if (!sticky_buttons_) {
+  if (!parameter_.sticky_buttons) {
     joy_msg_.buttons.at(e.jbutton.button) = 0;
-    publish = true;
+    return true;
   }
 
-  return publish;
+  return false;
 }
 
 bool Joy::handleJoyHatMotion(const SDL_Event & e)
 {
-  bool publish = false;
-
-  if (e.jhat.which != joystick_instance_id_) {
-    return publish;
+  if (e.jhat.which != parameter_.joystick_instance_id) {
+    return false;
   }
 
   // The hats are the last axes in the axes list.  There are two axes per hat;
@@ -269,17 +234,17 @@ bool Joy::handleJoyHatMotion(const SDL_Event & e)
   // the second of the pair is for up (positive) and down (negative).
 
   // Determine which pair we are based on e.jhat.hat
-  int num_axes = SDL_JoystickNumAxes(joystick_);
+  const int num_axes = SDL_JoystickNumAxes(joystick_);
   if (num_axes < 0) {
     RCLCPP_WARN(get_logger(), "Failed to get axes: %s", SDL_GetError());
-    return publish;
+    return false;
   }
   size_t axes_start_index = num_axes + e.jhat.hat * 2;
   // Note that we check axes_start_index + 1 here to ensure that we can write to
   // either the left/right axis or the up/down axis that corresponds to this hat.
   if ((axes_start_index + 1) >= joy_msg_.axes.size()) {
     RCLCPP_WARN(get_logger(), "Saw hat too large for this device, ignoring");
-    return publish;
+    return false;
   }
 
   if (e.jhat.value & SDL_HAT_LEFT) {
@@ -298,14 +263,13 @@ bool Joy::handleJoyHatMotion(const SDL_Event & e)
     joy_msg_.axes.at(axes_start_index) = 0.0;
     joy_msg_.axes.at(axes_start_index + 1) = 0.0;
   }
-  publish = true;
 
-  return publish;
+  return true;
 }
 
 void Joy::handleJoyDeviceAdded(const SDL_Event & e)
 {
-  if (!dev_name_.empty()) {
+  if (parameter_.dev_name.empty() == false) {
     int num_joysticks = SDL_NumJoysticks();
     if (num_joysticks < 0) {
       RCLCPP_WARN(get_logger(), "Failed to get the number of joysticks: %s", SDL_GetError());
@@ -318,35 +282,35 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
         RCLCPP_WARN(get_logger(), "Could not get joystick name: %s", SDL_GetError());
         continue;
       }
-      if (std::string(name) == dev_name_) {
+      if (std::string(name) == parameter_.dev_name) {
         // We found it!
         matching_device_found = true;
-        dev_id_ = i;
+        parameter_.dev_id = i;
         break;
       }
     }
     if (!matching_device_found) {
       RCLCPP_WARN(
         get_logger(), "Could not get joystick with name %s: %s",
-        dev_name_.c_str(), SDL_GetError());
+        parameter_.dev_name.c_str(), SDL_GetError());
       return;
     }
   }
 
-  if (e.jdevice.which != dev_id_) {
+  if (e.jdevice.which != parameter_.dev_id) {
     return;
   }
 
-  joystick_ = SDL_JoystickOpen(dev_id_);
+  joystick_ = SDL_JoystickOpen(parameter_.dev_id);
   if (joystick_ == nullptr) {
-    RCLCPP_WARN(get_logger(), "Unable to open joystick %d: %s", dev_id_, SDL_GetError());
+    RCLCPP_WARN(get_logger(), "Unable to open joystick %d: %s", parameter_.dev_id, SDL_GetError());
     return;
   }
 
   // We need to hold onto this so that we can properly remove it on a
   // remove event.
-  joystick_instance_id_ = SDL_JoystickGetDeviceInstanceID(dev_id_);
-  if (joystick_instance_id_ < 0) {
+  parameter_.joystick_instance_id = SDL_JoystickGetDeviceInstanceID(parameter_.dev_id);
+  if (parameter_.joystick_instance_id < 0) {
     RCLCPP_WARN(get_logger(), "Failed to get instance ID for joystick: %s", SDL_GetError());
     SDL_JoystickClose(joystick_);
     joystick_ = nullptr;
@@ -399,12 +363,12 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
 
   RCLCPP_INFO(
     get_logger(), "Opened joystick: %s.  deadzone: %f",
-    SDL_JoystickName(joystick_), scaled_deadzone_);
+    SDL_JoystickName(joystick_), parameter_.scaled_deadzone);
 }
 
 void Joy::handleJoyDeviceRemoved(const SDL_Event & e)
 {
-  if (e.jdevice.which != joystick_instance_id_) {
+  if (e.jdevice.which != parameter_.joystick_instance_id) {
     return;
   }
 
@@ -426,23 +390,18 @@ void Joy::eventThread()
   rclcpp::Time last_publish = this->now();
 
   do {
-    bool should_publish = false;
     SDL_Event e;
-    int wait_time_ms = autorepeat_interval_ms_;
-    if (publish_soon_) {
-      wait_time_ms = std::min(wait_time_ms, coalesce_interval_ms_);
-    }
-    int success = SDL_WaitEventTimeout(&e, wait_time_ms);
-    if (success == 1) {
+
+    if (SDL_WaitEventTimeout(&e, (parameter_.publishing_interval.nanoseconds() / 1000000) / 10)) {
       // Succeeded getting an event
       if (e.type == SDL_JOYAXISMOTION) {
-        should_publish = handleJoyAxis(e);
+        handleJoyAxis(e);
       } else if (e.type == SDL_JOYBUTTONDOWN) {
-        should_publish = handleJoyButtonDown(e);
+        handleJoyButtonDown(e);
       } else if (e.type == SDL_JOYBUTTONUP) {
-        should_publish = handleJoyButtonUp(e);
+        handleJoyButtonUp(e);
       } else if (e.type == SDL_JOYHATMOTION) {
-        should_publish = handleJoyHatMotion(e);
+        handleJoyHatMotion(e);
       } else if (e.type == SDL_JOYDEVICEADDED) {
         handleJoyDeviceAdded(e);
       } else if (e.type == SDL_JOYDEVICEREMOVED) {
@@ -450,26 +409,17 @@ void Joy::eventThread()
       } else {
         RCLCPP_INFO(get_logger(), "Unknown event type %d", e.type);
       }
-    } else {
-      // We didn't succeed, either because of a failure or because of a timeout.
-      // If we are autorepeating and enough time has passed, set should_publish.
-      rclcpp::Time now = this->now();
-      rclcpp::Duration diff_since_last_publish = now - last_publish;
-      if ((autorepeat_rate_ > 0.0 &&
-        RCL_NS_TO_MS(diff_since_last_publish.nanoseconds()) >= autorepeat_interval_ms_) ||
-        publish_soon_)
-      {
-        last_publish = now;
-        should_publish = true;
-        publish_soon_ = false;
-      }
     }
 
-    if (joystick_ != nullptr && should_publish) {
-      joy_msg_.header.frame_id = "joy";
-      joy_msg_.header.stamp = this->now();
+    const auto now = get_clock()->now();
+    const auto dt = now - last_publish;
+
+    if (joystick_ != nullptr && dt >= parameter_.publishing_interval) {
+      joy_msg_.header.frame_id = parameter_.frame_id_;
+      joy_msg_.header.stamp = now;
 
       pub_->publish(joy_msg_);
+      last_publish = now;
     }
 
     status = future_.wait_for(std::chrono::seconds(0));
